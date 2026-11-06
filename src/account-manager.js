@@ -2,6 +2,7 @@ import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } 
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
+import { codexCreditPolicy, parseCodexCredits, observeCodexCredits, codexCreditsAvailable, codexIncludedQuota } from './codex-credits.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
@@ -147,6 +148,7 @@ const PERSISTED_QUOTA_FIELDS = [
   // until something next reads the usage endpoint — and the row that says so is the
   // only place an operator sees one at all.
   'resetCredits',
+  'codexCreditBudget',
   // Until when a Claude reset attempt on this account holds the whole Claude
   // pool (claude-resets.js): a bare timestamp, so a restart minutes after a
   // claim that may have landed does not spend a sibling's on top of it.
@@ -442,6 +444,7 @@ function makeAccount(acct, index, listener = null) {
     // hand-edited config cannot start billing, and Anthropic OAuth logins only
     // (see accountAllowsExtraUsage). See _pickFallback.
     allowExtraUsage: accountAllowsExtraUsage(acct),
+    codexCredits: codexCreditPolicy(acct),
     // This account's own egress proxy, parsed (accounts[].routing). Every
     // socket opened for the account tunnels through it — request forwarding,
     // token refresh, profile, usage and quota probes — and it outranks both sx
@@ -629,6 +632,8 @@ export class AccountManager {
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
   constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
+    /** @type {(() => Promise<void>)|null} */
+    this.persistCreditState = null;
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -886,6 +891,7 @@ export class AccountManager {
    * @param {string|null} [model]
    */
   capExceeded(account, model = null) {
+    if (account?.codexCredits && !codexIncludedQuota(account, model) && !codexCreditsAvailable(account)) return 'credits';
     // The money cap first: it is the budget the usage caps exist to protect.
     // Past it the account is held to its included quota, as if every bucket
     // this request meters had a hard cap of 1.0 — see _spendCapBinds. `spend`
@@ -1048,6 +1054,22 @@ export class AccountManager {
   capBars(account, model = null, advisorModel = null) {
     return this.capExceeded(account, model)
       || (advisorModel && this.advisorEligibility !== 'prefer' ? this._familyCapExceeded(account, advisorModel) : null);
+  }
+
+  /** Persist the baseline before a potentially paid request; storage failure is not permission.
+   * @param {Record<string, any>} account @param {string|null} [model]
+   */
+  async prepareCodexCreditRequest(account, model = null) {
+    if (!account.codexCredits || codexIncludedQuota(account, model)) return true;
+    if (!codexCreditsAvailable(account) || !this.persistCreditState) return false;
+    const policy = account.codexCredits;
+    const budget = account.quota.codexCreditBudget;
+    try {
+      await this.persistCreditState();
+      return account.codexCredits === policy && account.quota.codexCreditBudget === budget && !this.capBars(account, model);
+    } catch {
+      return false;
+    }
   }
 
   /** Start (or restart) the ramp window for an account that just became current,
@@ -1445,7 +1467,7 @@ export class AccountManager {
     // ending it there re-announced and re-ramped the same account on the next
     // request. And none of this runs for a fleet with no opt-in and no episode
     // to end, so such a fleet pays nothing per request for the feature.
-    if (this._extraUsage.size || this.accounts.some(a => a.allowExtraUsage)) {
+    if (this._extraUsage.size || this.accounts.some(a => a.allowExtraUsage || a.codexCredits?.enabled)) {
       const scope = this._cursorKey(model, null, provider);
       const excluded = /** @type {Set<number>|null} */ (exclude);
       if (this._extraUsage.has(scope) && ((!account && !excluded?.size) || (account && this._isAvailable(account, model)))) {
@@ -1523,6 +1545,7 @@ export class AccountManager {
     if (!account) return false;
     for (const e of this._extraUsage.values()) {
       if (e.account !== account || !e.paid) continue;
+      if (account.codexCredits && !codexIncludedQuota(account, e.model)) return true;
       if (this._maxUtilization(account, e.model) >= 1) return true;
       const spend = /** @type {{ usedMinor?: number } | null} */ (account.quota.spend);
       if ((spend?.usedMinor || 0) > e.usedMinorAt) return true;
@@ -2744,6 +2767,10 @@ export class AccountManager {
     for (const account of this.accounts) {
       if (exclude?.has(account.index)) continue;
       if (!this._isProbeable(account)) continue;
+      // A live inference probe can bill. Credit-enabled accounts are selected
+      // by the free-first fallback instead; read-only probes refresh the rest.
+      if ((account.codexCredits || (providerOf(account) === 'codex' && this.accounts.some(a => a.codexCredits?.enabled)))
+          && !codexIncludedQuota(account, model)) continue;
       // A family-exhausted account can't serve that family even as a probe — it
       // would just 429 again — so skip it (Fable/Sonnet) and let the caller emit
       // the synthetic 429 when no other account is available.
@@ -2856,7 +2883,7 @@ export class AccountManager {
    * @returns {{ account: Record<string, any>, paid: boolean } | null}
    */
   _pickFallback(exclude = null, model = null, provider = DEFAULT_PROVIDER, advisorModel = null) {
-    if (!this.accounts.some(a => a.allowExtraUsage)) return null;
+    if (!this.accounts.some(a => providerOf(a) === provider && (a.allowExtraUsage || a.codexCredits?.enabled))) return null;
     const partition = this._excludeOtherProviders(null, provider);
     if (this.accounts.some(a => !partition?.has(a.index) && this._isAvailable(a, model))) return null;
 
@@ -2879,11 +2906,13 @@ export class AccountManager {
       // can read as `quota` here; the verdict itself decides the tier, because
       // upstream has said the next request 429s whatever the counters say.
       const rejected = account.quota.unifiedStatus === 'rejected';
-      if (usage < 1 && !rejected) {
+      if (usage < 1 && !rejected && (!account.codexCredits || codexIncludedQuota(account, model))) {
         if (better(priority, usage, freeRank)) { free = account; freeRank = [priority, usage]; }
         continue;
       }
-      if (!account.allowExtraUsage) continue;
+      if (account.codexCredits) {
+        if (!codexCreditsAvailable(account)) continue;
+      } else if (!account.allowExtraUsage) continue;
       const spend = /** @type {{ enabled?: boolean } | null} */ (account.quota.spend);
       if (spend?.enabled === false) continue;
       if (better(priority, usage, paidRank)) { paid = account; paidRank = [priority, usage]; }
@@ -2924,6 +2953,7 @@ export class AccountManager {
     // spend-capped account still serves while its buckets are under 1.0, and
     // reads `spend-capped` once they are not or are unknown.
     const cap = this.capExceeded(account, model);
+    if (cap === 'credits') return 'credit-capped';
     if (cap === 'spend') return 'spend-capped';
     if (cap) return 'capped';
 
@@ -2960,6 +2990,7 @@ export class AccountManager {
     // that family — the account still serves every other model normally. It also
     // expires stale windows, so run it before reading unifiedStatus below.
     if (this._isNearQuota(account, model)) return 'quota';
+    if (account.codexCredits && !codexIncludedQuota(account, model)) return 'quota';
 
     // Upstream's own verdict. `rejected` means a shared bucket is spent, so the
     // next request would 429 whatever the local counters say — believing it
@@ -4650,6 +4681,7 @@ export class AccountManager {
    * @param {string|null} [model] The model the client asked for, if any.
    */
   _updateCodexQuota(account, headers, model) {
+    observeCodexCredits(account, parseCodexCredits(headers));
     const parsed = parseCodexQuota(headers);
     const observed = new Set();
     // Header-derived strings are rendered into status and logs, so they are
@@ -5303,6 +5335,7 @@ export class AccountManager {
   applyCodexUsageData(accountIndex, usage) {
     const account = this.accounts[accountIndex];
     if (!account || !usage || usage.error) return;
+    observeCodexCredits(account, usage.credits ?? null);
     // The Codex-learned fields below are written here for the first time, so the
     // empty-quota shape does not carry them. See CodexLearnedQuota.
     /** @type {typeof account.quota & CodexLearnedQuota} */
@@ -5984,6 +6017,7 @@ export class AccountManager {
         // rather than only seeing this account's already-resolved default.
         switchThreshold: a.switchThreshold ?? null,
         allowExtraUsage: a.allowExtraUsage === true,
+        codexCredits: a.codexCredits ? { ...a.codexCredits } : null,
         // True while this account is the extra-usage fallback — serving past
         // its quota and billing for it. The one state `unavailable` alone
         // cannot tell apart from an account that is simply out.

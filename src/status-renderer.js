@@ -161,6 +161,7 @@ export const UNAVAILABLE_TEXT = {
   quota: 'local switch threshold reached',
   capped: 'account usage cap reached (maxUsage)',
   'spend-capped': 'extra-usage spend cap reached (maxSpend)',
+  'credit-capped': 'Codex credit budget blocks paid usage (check budget and fresh quota/credit readings)',
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
   routing: "the account's routing proxy is unreachable (cooldown)",

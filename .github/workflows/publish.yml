@@ -24,6 +24,7 @@ on:
 jobs:
   publish:
     name: publish to npm
+    if: github.repository == 'KarpelesLab/teamclaude'
     runs-on: ubuntu-latest
     permissions:
       contents: write   # create the git tag + GitHub release
