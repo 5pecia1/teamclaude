@@ -1,5 +1,9 @@
 # TeamClaude
 
+> **5pecia1 fork:** This build adds Codex credit budgets and is distributed through
+> [GitHub Releases](https://github.com/5pecia1/teamclaude/releases), not the upstream npm package.
+> For Raspberry Pi download, installation, and update precautions, see [the Raspberry Pi guide](docs/raspberry-pi.md).
+
 [![CI](https://github.com/KarpelesLab/teamclaude/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/teamclaude/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/@karpeleslab/teamclaude.svg)](https://www.npmjs.com/package/@karpeleslab/teamclaude)
 [![node](https://img.shields.io/node/v/@karpeleslab/teamclaude.svg)](https://nodejs.org)
