@@ -3911,6 +3911,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
+    if (!await accountManager.prepareCodexCreditRequest(account, ctx.model)) {
+      accountManager.release(account.index, { successful: false });
+      ctx.status = 503;
+      res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
+      res.end(JSON.stringify({ type: 'error', error: {
+        type: 'overloaded_error', message: 'Codex credit budget could not be saved or is no longer available; no request was sent upstream.',
+      } }));
+      return;
+    }
     if (ctx.pinnedIndex == null && accountManager.isBillingRejected(account.index)) {
       accountManager.release(account.index, { successful: false });
       ctx.tried.add(account.index);

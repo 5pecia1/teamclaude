@@ -40,6 +40,7 @@ Already logged into Claude Code? `teamclaude import` takes its credentials inste
 - Optionally leans on accounts with Anthropic's paid extra usage once every account is out of free quota, instead of returning 429 (`allowExtraUsage`, off by default — it bills real money). Quota between the switch threshold and 100% is used first, on any account; billing starts only when none is left, and stops as soon as a window resets.
 - Refreshes OAuth tokens before they expire and writes them back to config. Client refreshes pass through untouched.
 - Pools OpenAI Codex subscriptions alongside Claude accounts (experimental): the Codex CLI is routed through the same proxy, by config or transparently through the MITM proxy, and rotates on its own quota.
+- Optional Codex credit budgets cap potentially paid usage using a local, persistent balance-decrease ledger; see [Codex credit budget](docs/quota.md#codex-credit-budget).
 - Takes any Anthropic-compatible API (DeepSeek, GLM) as a low-priority fallback for when the Claude accounts are done.
 - Sends one account's traffic through its own HTTP or SOCKS proxy (`login --routing "socks5h://user:pass@host:1080"`), sign-in and token refresh included, and leaves every other account alone. If that proxy goes down, the request fails over to the next account.
 - No dependencies. Node built-ins only.
@@ -59,7 +60,7 @@ Full reference: [docs/usage.md](docs/usage.md).
 
 ## Configuration
 
-Config is at `~/.config/teamclaude.json` (`$XDG_CONFIG_HOME` honoured) and is meant to be hand-editable. A proxy API key is generated on first use. Observed quota goes to a separate `teamclaude.state.json` next to it, safe to delete since quota gets re-learned from traffic.
+Config is at `~/.config/teamclaude.json` (`$XDG_CONFIG_HOME` honoured) and is meant to be hand-editable. A proxy API key is generated on first use. Observed quota goes to a separate `teamclaude.state.json` next to it; deleting it resets any configured Codex credit budget, so protect it when using that feature.
 
 Every field, plus environment variables and network tuning: [docs/configuration.md](docs/configuration.md).
 

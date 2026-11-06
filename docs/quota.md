@@ -65,6 +65,35 @@ Running the probe sidesteps this entirely — it refreshes the family buckets fr
 
 A probe revalidates a family bucket in full, which includes concluding that there is no cap. When the payload enumerates an account's scoped weekly caps and a family is **not** among them, the cached reading is cleared and that family falls back to the shared weekly bucket — upstream retiring a cap must not leave the proxy gating on it. A payload that carries no such enumeration proves nothing, so nothing changes. Each reported bucket also carries its own reset, taken verbatim: an unstarted window has no reset, and the bar shows no date rather than the shared weekly one.
 
+## Codex credit budget
+
+Codex OAuth accounts can opt into a local budget for potentially paid usage when their included quota is exhausted. It is disabled by default:
+
+```json
+{
+  "name": "codex@example.com",
+  "type": "oauth",
+  "provider": "codex",
+  "codexCredits": {
+    "enabled": true,
+    "maxUsage": 100,
+    "budgetId": "budget-1"
+  }
+}
+```
+
+- `enabled` must be the literal `true` to opt in.
+- `maxUsage` is a finite, non-negative decimal in the same balance units Codex reports, **not USD**. It is cumulative observed decrease, not a monthly bill; `0` permits no paid usage.
+- `budgetId` is a required, operator-chosen identifier of 1–64 ASCII letters, digits, underscores, dots, or hyphens. Changing it starts a new budget from zero on the next valid balance reading; changing the limit or disabling/re-enabling the same ID does not reset accumulated usage.
+
+An absent policy preserves the prior routing behavior. A present but disabled or invalid policy fails closed for potentially paid requests and requires fresh proof that included quota is still available. A paid fallback is considered only when no eligible Codex account has known included-quota headroom, and it still respects disabled accounts, routes, errors, 429 holds, and account caps. Explicit account pins honor this budget but intentionally target the pinned account rather than following free-first fleet rotation. After the budget is reached, the account receives no potentially paid request, including a pinned request or the live revalidation probe; fresh included quota may still be used.
+
+The proxy needs a recent Codex credit reading before it can authorize paid usage. A balance must be finite and positive, and upstream must explicitly report credits available and not unlimited. Missing, `null`, unlimited, zero, negative, nonnumeric, or stale readings do not authorize a paid request. Readings older than five minutes are stale. Configure `quotaProbeSeconds: 60` (recommended) to keep idle accounts fresh; otherwise traffic response headers must refresh the reading often enough. The usage probe is read-only and does not consume message quota.
+
+Before a potentially paid dispatch, the proxy must successfully persist the budget state. If saving fails or no persistence callback is configured, the request receives `503` and is not sent upstream. The `codexCreditBudget` ledger (budget ID, cumulative used amount, baseline balance) is stored in `teamclaude.state.json`; a fresh balance is required after restart before the account can use paid fallback. Protect this file. Deleting it loses the accumulated budget, and the budget does **not** reset monthly. Editing config and reloading applies policy changes; `teamclaude status --json` includes the resolved policy and ledger. There is no UI form for this setting.
+
+This is a conservative local estimate, not an upstream billing limit or exact per-proxy attribution. Balance decreases can include other clients' usage or balance expiry, and overlapping requests can overshoot because several requests may already be in flight. A top-up between samples can mask spending; out-of-order readings can overcount. Each positive observed decrease is rounded upward to six decimal places in the ledger. Use one local proxy for the account when practical, and keep a separate margin below any external hard spending limit.
+
 ## Spend from outside the proxy
 
 An account in the pool can also be used somewhere else — a local login, a credentials file on another machine — and that spend lands on the same weekly limit while none of the proxy's counters see it. `quota.outsideSpend` in `/teamclaude/status` reports how much of each weekly window was spent elsewhere, as a share of that week:

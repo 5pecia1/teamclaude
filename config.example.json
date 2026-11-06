@@ -61,7 +61,12 @@
       "name": "codex@example.com",
       "type": "oauth",
       "provider": "codex",
-      "priority": 0
+      "priority": 0,
+      "codexCredits": {
+        "enabled": false,
+        "maxUsage": 100,
+        "budgetId": "budget-1"
+      }
     },
     {
       "name": "api-fallback",

@@ -415,9 +415,15 @@ async function serverCommand() {
   accountManager.selectActiveAccount();
 
   // Periodically persist quota (and once more on shutdown) to the state file.
-  const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState() })
-      .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
+  let stateSave = Promise.resolve();
+  const writeQuotaState = () => {
+    stateSave = stateSave.catch(() => {}).then(() =>
+      saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState() }));
+    return stateSave;
+  };
+  accountManager.persistCreditState = writeQuotaState;
+  const persistQuotaState = () => writeQuotaState()
+    .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
   let quotaSaveInterval = null;
   // Sampled on the same minute tick, but only written when a sample was taken
   // or something was pruned: about once per SAMPLE_INTERVAL_MS.
