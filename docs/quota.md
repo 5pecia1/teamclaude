@@ -67,7 +67,13 @@ A probe revalidates a family bucket in full, which includes concluding that ther
 
 ## Codex credit budget
 
-Codex OAuth accounts can opt into a local budget for potentially paid usage when their included quota is exhausted. It is disabled by default:
+Set `"codexCredits": true` on a Codex OAuth account to use its first verified positive credit balance as a fixed local limit. The proxy reads balances from Codex and stores the limit and cumulative usage in `teamclaude.state.json`. For example, a first balance of 250 sets a 250-credit limit. Top-ups, restarts and turning the setting off and on keep that limit and its accumulated usage.
+
+Set `"codexCredits": false` to permit only confirmed included quota. Both boolean settings use read-only Codex usage probes at startup and at least once a minute, even when the fleet-wide probe is off. Turning the setting on via config reload triggers a read immediately. A first balance that is missing, zero or explicitly unlimited leaves the automatic budget waiting for a positive finite balance.
+
+### Manual limit
+
+To set your own limit, use the existing object form:
 
 ```json
 {
@@ -88,9 +94,9 @@ Codex OAuth accounts can opt into a local budget for potentially paid usage when
 
 An absent policy preserves the prior routing behavior. A present but disabled or invalid policy fails closed for potentially paid requests and requires fresh proof that included quota is still available. A paid fallback is considered only when no eligible Codex account has known included-quota headroom, and it still respects disabled accounts, routes, errors, 429 holds, and account caps. Explicit account pins honor this budget but intentionally target the pinned account rather than following free-first fleet rotation. After the budget is reached, the account receives no potentially paid request, including a pinned request or the live revalidation probe; fresh included quota may still be used.
 
-The proxy needs a recent Codex credit reading before it can authorize paid usage. A balance must be finite and positive, and upstream must explicitly report credits available and not unlimited. Missing, `null`, unlimited, zero, negative, nonnumeric, or stale readings do not authorize a paid request. Readings older than five minutes are stale. Configure `quotaProbeSeconds: 60` (recommended) to keep idle accounts fresh; otherwise traffic response headers must refresh the reading often enough. The usage probe is read-only and does not consume message quota.
+The proxy needs a recent Codex credit reading before it can authorize paid usage. A balance must be finite and positive, and upstream must explicitly report credits available and not unlimited. Missing, `null`, unlimited, zero, negative, nonnumeric, or stale readings do not authorize a paid request. Readings older than five minutes are stale. For manual limits, set `quotaProbeSeconds: 60` to keep idle accounts fresh. The usage probe is read-only and does not consume message quota.
 
-Before a potentially paid dispatch, the proxy must successfully persist the budget state. If saving fails or no persistence callback is configured, the request receives `503` and is not sent upstream. The `codexCreditBudget` ledger (budget ID, cumulative used amount, baseline balance) is stored in `teamclaude.state.json`; a fresh balance is required after restart before the account can use paid fallback. Protect this file. Deleting it loses the accumulated budget, and the budget does **not** reset monthly. Editing config and reloading applies policy changes; `teamclaude status --json` includes the resolved policy and ledger. There is no UI form for this setting.
+Before a potentially paid dispatch, the proxy must successfully persist the budget state. If saving fails or no persistence callback is configured, the request receives `503` and is not sent upstream. The state file retains both the automatic limit and the manual ledger when switching modes. After a restart, the proxy needs a fresh balance before it can use paid fallback. Budgets have no scheduled reset. Deleting the state file loses the accumulated budgets. Editing config and reloading applies policy changes. For a boolean setting, `teamclaude status --json` shows `enabled`, `waitingForBalance`, the fixed `maxUsage` and cumulative `used` under the account's `codexCredits`.
 
 This is a conservative local estimate, not an upstream billing limit or exact per-proxy attribution. Balance decreases can include other clients' usage or balance expiry, and overlapping requests can overshoot because several requests may already be in flight. A top-up between samples can mask spending; out-of-order readings can overcount. Each positive observed decrease is rounded upward to six decimal places in the ledger. Use one local proxy for the account when practical, and keep a separate margin below any external hard spending limit.
 

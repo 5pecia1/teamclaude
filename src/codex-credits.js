@@ -1,9 +1,11 @@
 // A local budget over observed Codex balance decreases, not an upstream billing limit.
 export const CODEX_CREDIT_MAX_AGE_MS = 5 * 60_000;
 
-/** @typedef {{enabled: boolean, maxUsage: number, budgetId: string}} CreditPolicy */
+/** @typedef {{enabled: boolean, maxUsage: number, budgetId: string, automatic?: false} | {enabled: boolean, automatic: true}} CreditPolicy */
 /** @typedef {{hasCredits: boolean|null, unlimited: boolean|null, balance: number|null}} CreditReading */
-/** @typedef {{budgetId: string, used: number, lastBalance: number, startedAt: number}} CreditBudget */
+/** @typedef {{used: number, lastBalance: number, startedAt: number}} CreditLedger */
+/** @typedef {CreditLedger & {budgetId: string}} CreditBudget */
+/** @typedef {CreditLedger & {maxUsage: number}} AutomaticCreditBudget */
 
 /** @param {unknown} value */
 function decimal(value) {
@@ -46,6 +48,7 @@ export function parseCodexCredits(headers) {
 export function codexCreditPolicy(account) {
   if (account.provider !== 'codex' || account.type !== 'oauth' || account.codexCredits === undefined) return null;
   const raw = account.codexCredits;
+  if (typeof raw === 'boolean') return { enabled: raw, automatic: true };
   const validLimit = typeof raw?.maxUsage === 'number' && decimal(raw.maxUsage) != null && raw.maxUsage >= 0;
   const validId = typeof raw?.budgetId === 'string' && /^[\w.-]{1,64}$/.test(raw.budgetId);
   return {
@@ -55,32 +58,82 @@ export function codexCreditPolicy(account) {
   };
 }
 
-/** @param {any} value @param {string} id @returns {value is CreditBudget} */
-export function validCreditBudget(value, id) {
-  return value?.budgetId === id && typeof value.used === 'number' && Number.isFinite(value.used) && value.used >= 0
+/** @param {any} value @returns {value is CreditLedger} */
+function validLedger(value) {
+  return typeof value?.used === 'number' && Number.isFinite(value.used) && value.used >= 0
     && typeof value.lastBalance === 'number' && decimal(value.lastBalance) != null
     && typeof value.startedAt === 'number' && Number.isFinite(value.startedAt) && value.startedAt > 0;
 }
 
+/** @param {any} value @param {string} id @returns {value is CreditBudget} */
+export function validCreditBudget(value, id) {
+  return value?.budgetId === id && validLedger(value);
+}
+
+/** @param {any} value @returns {value is AutomaticCreditBudget} */
+function validAutomaticBudget(value) {
+  return typeof value?.maxUsage === 'number' && value.maxUsage > 0
+    && decimal(value.maxUsage) != null && validLedger(value);
+}
+
+/** @param {CreditReading|null|undefined} reading @returns {reading is CreditReading & {balance: number}} */
+function hasSpendableBalance(reading) {
+  return reading?.hasCredits === true && reading.unlimited === false
+    && typeof reading.balance === 'number' && reading.balance > 0 && decimal(reading.balance) != null;
+}
+
+/** @param {CreditLedger} ledger @param {number} balance */
+function recordDecrease(ledger, balance) {
+  // Top-ups never refund local spending. Round a positive decrease up to a micro-unit.
+  const decrease = Math.max(0, ledger.lastBalance - balance);
+  const usedMicros = Math.round(ledger.used * 1e6) + Math.ceil(decrease * 1e6);
+  ledger.used = usedMicros / 1e6;
+  ledger.lastBalance = balance;
+}
+
 /** @param {Record<string, any>} account @param {CreditReading|null} reading @param {number} [now] */
 export function observeCodexCredits(account, reading, now = Date.now()) {
-  if (!reading) return;
+  if (!reading) return false;
   const q = account.quota;
   q.codexCredits = { ...reading, seenAt: now };
+  const balance = reading.balance;
+  if (balance == null || decimal(balance) == null) return false;
   const policy = account.codexCredits;
-  if (!policy?.budgetId || reading.balance == null) return;
+  const automatic = q.codexAutoCreditBudget;
+  if (validAutomaticBudget(automatic) && reading.unlimited === false && balance >= 0) {
+    recordDecrease(automatic, balance);
+  }
+  if (policy?.automatic && policy.enabled && automatic == null && hasSpendableBalance(reading)) {
+    q.codexAutoCreditBudget = { maxUsage: balance, used: 0, lastBalance: balance, startedAt: now };
+    return true;
+  }
+  if (policy?.automatic || !policy?.budgetId) return false;
   const previous = q.codexCreditBudget;
   if (!previous || previous.budgetId !== policy.budgetId) {
-    q.codexCreditBudget = { budgetId: policy.budgetId, used: 0, lastBalance: reading.balance, startedAt: now };
+    q.codexCreditBudget = { budgetId: policy.budgetId, used: 0, lastBalance: balance, startedAt: now };
   } else if (validCreditBudget(previous, policy.budgetId)) {
-    // Top-ups never refund local spending. Out-of-order snapshots can overcount,
-    // so this is deliberately a conservative balance-decrease budget.
-    const decrease = Math.max(0, previous.lastBalance - reading.balance);
-    // Round each positive observed decrease up to a micro-unit.
-    const usedMicros = Math.round(previous.used * 1e6) + Math.ceil(decrease * 1e6);
-    previous.used = usedMicros / 1e6;
-    previous.lastBalance = reading.balance;
+    recordDecrease(previous, balance);
   }
+  return false;
+}
+
+/** @param {Record<string, any>} account */
+export function currentCodexCreditBudget(account) {
+  return account.codexCredits?.automatic ? account.quota.codexAutoCreditBudget : account.quota.codexCreditBudget;
+}
+
+/** @param {Record<string, any>} account */
+export function codexCreditStatus(account) {
+  const policy = account.codexCredits;
+  if (!policy?.automatic) return policy ? { ...policy } : null;
+  const budget = currentCodexCreditBudget(account);
+  const resolved = validAutomaticBudget(budget) ? budget : null;
+  return {
+    ...policy,
+    waitingForBalance: policy.enabled && (budget == null || !hasFreshBalance(account.quota.codexCredits)),
+    maxUsage: resolved?.maxUsage ?? null,
+    used: resolved?.used ?? null,
+  };
 }
 
 /** @param {unknown} seenAt @param {number} now */
@@ -88,17 +141,18 @@ function fresh(seenAt, now) {
   return typeof seenAt === 'number' && seenAt <= now && now - seenAt <= CODEX_CREDIT_MAX_AGE_MS;
 }
 
+/** @param {(CreditReading & {seenAt: number})|undefined} credits */
+function hasFreshBalance(credits, now = Date.now()) {
+  return fresh(credits?.seenAt, now) && hasSpendableBalance(credits);
+}
+
 /** @param {Record<string, any>} account @param {number} [now] */
 export function codexCreditsAvailable(account, now = Date.now()) {
   const policy = account.codexCredits;
-  const q = account.quota;
-  const credits = q.codexCredits;
-  const budget = q.codexCreditBudget;
-  return policy?.enabled === true && policy.maxUsage > 0
-    && validCreditBudget(budget, policy.budgetId) && budget.used < policy.maxUsage
-    && credits?.hasCredits === true && credits.unlimited === false
-    && typeof credits.balance === 'number' && credits.balance > 0
-    && fresh(credits.seenAt, now);
+  if (policy?.enabled !== true || !hasFreshBalance(account.quota.codexCredits, now)) return false;
+  const budget = currentCodexCreditBudget(account);
+  if (policy.automatic) return validAutomaticBudget(budget) && budget.used < budget.maxUsage;
+  return validCreditBudget(budget, policy.budgetId) && budget.used < policy.maxUsage;
 }
 
 /** Only recent, explicitly stated included quota can bypass a credit budget.

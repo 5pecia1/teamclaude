@@ -1,6 +1,6 @@
 // Opt-in background quota probe.
 //
-// DISABLED BY DEFAULT. When enabled (config.quotaProbeSeconds > 0), periodically
+// The fleet-wide probe is off by default. When enabled, it periodically
 // reads an OAuth account's quota zero-spend /api/oauth/usage endpoint so idle
 // accounts' utilization/reset stay fresh without waiting to rotate onto them.
 // A sanctioned active-upstream feature (the other is the opt-in keep-warm
@@ -19,6 +19,7 @@ import { fetchCodexUsage } from './codex-usage.js';
 // would instead probe in a tight loop. The TUI and CLI accept any number of
 // seconds, so the ceiling lives here where the timer is armed.
 export const MAX_PROBE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+export const AUTO_CREDIT_PROBE_INTERVAL_MS = 60_000;
 
 // How often an account's OAuth profile is read again once its plan is known. A
 // plan that lapses shows there (see AccountManager.applyProfileData), and it
@@ -83,6 +84,11 @@ export class Prober {
     this.timeoutMs = timeoutMs;
     this.log = log;
     this.timer = null;
+    this.autoCreditTimer = null;
+    /** @type {WeakMap<object, boolean>} */
+    this.autoCreditModes = new WeakMap();
+    /** @type {WeakMap<object, Promise<void>>} */
+    this.codexReads = new WeakMap();
     this._running = false;
     this.lastRunStartedAt = null;
     this.lastRunFinishedAt = null;
@@ -91,7 +97,7 @@ export class Prober {
   }
 
   start() {
-    if (this.intervalMs > 0) this.reschedule(this.intervalMs);
+    this.reschedule(this.intervalMs);
   }
 
   /** Change interval at runtime (0 = off). Probes once immediately when on. */
@@ -113,10 +119,39 @@ export class Prober {
       this.nextRunAt = null;
       this.log('[TeamClaude] Quota probe disabled');
     }
+    this.syncAutoCreditProbes();
+  }
+
+  /** Read boolean-policy accounts even when the fleet probe is off or too slow. */
+  syncAutoCreditProbes() {
+    const accounts = this.am.accounts.filter((/** @type {Record<string, any>} */ account) => this._isAutoCreditTarget(account));
+    const previous = this.autoCreditModes;
+    this.autoCreditModes = new WeakMap();
+    for (const account of accounts) {
+      const enabled = account.codexCredits.enabled;
+      this.autoCreditModes.set(account, enabled);
+      if ((!previous.has(account) || (enabled && !previous.get(account))) && this._probeable(account)) {
+        void this.probeAccount(account);
+      }
+    }
+    const needsTimer = accounts.length > 0 && (this.intervalMs === 0 || this.intervalMs > AUTO_CREDIT_PROBE_INTERVAL_MS);
+    if (needsTimer && !this.autoCreditTimer) {
+      this.autoCreditTimer = setInterval(() => {
+        for (const account of this.am.accounts) {
+          if (this._isAutoCreditTarget(account) && this._probeable(account)) void this.probeAccount(account);
+        }
+      }, AUTO_CREDIT_PROBE_INTERVAL_MS);
+      this.autoCreditTimer.unref?.();
+    } else if (!needsTimer && this.autoCreditTimer) {
+      clearInterval(this.autoCreditTimer);
+      this.autoCreditTimer = null;
+    }
   }
 
   stop() {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this.autoCreditTimer) { clearInterval(this.autoCreditTimer); this.autoCreditTimer = null; }
+    this.autoCreditModes = new WeakMap();
     this.nextRunAt = null;
   }
 
@@ -155,6 +190,12 @@ export class Prober {
     return isCodexProbeTarget(account);
   }
 
+  /** @param {Record<string, any>} account */
+  _isAutoCreditTarget(account) {
+    // With paid credits off, a fresh read still proves that included quota can serve.
+    return this._isCodexProbeTarget(account) && account.codexCredits?.automatic === true;
+  }
+
   /** A third-party backend that publishes a quota of its own. The provider
    * module decides which; nothing in this file knows one by name. */
   _isBackendTarget(account) {
@@ -181,12 +222,21 @@ export class Prober {
   }
 
   async probeAccount(account) {
+    const codex = this._isCodexProbeTarget(account);
+    const pending = codex && this.codexReads.get(account);
+    if (pending) return pending;
     const startedAt = Date.now();
     this._recordAccount(account, { status: 'running', startedAt });
+    if (codex) {
+      const read = this._probeCodex(account, startedAt);
+      this.codexReads.set(account, read);
+      try { await read; }
+      finally { this.codexReads.delete(account); }
+      return;
+    }
     // A third-party backend has no Anthropic usage to read; it publishes its own
     // figure, or none. Same schedule, same status row, different source.
     if (this._isBackendTarget(account)) return this._probeBackend(account, startedAt);
-    if (this._isCodexProbeTarget(account)) return this._probeCodex(account, startedAt);
     try {
       await this.am.ensureTokenFresh(account.index);
       const readOptions = {
@@ -261,6 +311,8 @@ export class Prober {
         this._recordAccount(account, { status: usage?.error ? 'error' : 'timeout', error: usage?.error || 'probe timed out', startedAt, finishedAt, durationMs: finishedAt - startedAt });
         return;
       }
+      // An account removed during the read can leave its index to a sibling.
+      if (this.am.accounts[account.index] !== account) return;
       this.am.applyCodexUsageData(account.index, usage);
       const finishedAt = Date.now();
       this._recordAccount(account, { status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });

@@ -2,7 +2,7 @@ import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, isRefreshRejec
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
-import { codexCreditPolicy, parseCodexCredits, observeCodexCredits, codexCreditsAvailable, codexIncludedQuota } from './codex-credits.js';
+import { codexCreditPolicy, codexCreditStatus, currentCodexCreditBudget, parseCodexCredits, observeCodexCredits, codexCreditsAvailable, codexIncludedQuota } from './codex-credits.js';
 import { sameIdentity, sameOrg } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
 import { SessionTracker } from './session-tracker.js';
@@ -180,6 +180,7 @@ const PERSISTED_QUOTA_FIELDS = [
   // only place an operator sees one at all.
   'resetCredits',
   'codexCreditBudget',
+  'codexAutoCreditBudget',
   // Until when a Claude reset attempt on this account holds the whole Claude
   // pool (claude-resets.js): a bare timestamp, so a restart minutes after a
   // claim that may have landed does not spend a sibling's on top of it.
@@ -1344,10 +1345,11 @@ export class AccountManager {
     if (!account.codexCredits || codexIncludedQuota(account, model)) return true;
     if (!codexCreditsAvailable(account) || !this.persistCreditState) return false;
     const policy = account.codexCredits;
-    const budget = account.quota.codexCreditBudget;
+    const budget = currentCodexCreditBudget(account);
     try {
       await this.persistCreditState();
-      return account.codexCredits === policy && account.quota.codexCreditBudget === budget && !this.capBars(account, model);
+      return account.index >= 0 && account.codexCredits === policy
+        && currentCodexCreditBudget(account) === budget && !this.capBars(account, model);
     } catch {
       return false;
     }
@@ -6494,9 +6496,15 @@ export class AccountManager {
     return null;
   }
 
-  /**
-   * Update an account's quota tracking from upstream response headers.
-   */
+  /** @param {Record<string, any>} account @param {import('./codex-credits.js').CreditReading|null} reading */
+  _observeCodexCredits(account, reading) {
+    if (observeCodexCredits(account, reading)) {
+      // Checkpoint the first automatic limit even before paid traffic needs it.
+      // The shared writer logs errors, and every paid dispatch still saves strictly.
+      this.persistCreditState?.().catch(() => {});
+    }
+  }
+
   /**
    * Apply a Codex response's rate-limit headers.
    *
@@ -6507,7 +6515,7 @@ export class AccountManager {
    * @param {string|null} [model] The model the client asked for, if any.
    */
   _updateCodexQuota(account, headers, model) {
-    observeCodexCredits(account, parseCodexCredits(headers));
+    this._observeCodexCredits(account, parseCodexCredits(headers));
     const parsed = parseCodexQuota(headers);
     const observed = new Set();
     // Header-derived strings are rendered into status and logs, so they are
@@ -7190,7 +7198,7 @@ export class AccountManager {
   applyCodexUsageData(accountIndex, usage) {
     const account = this.accounts[accountIndex];
     if (!account || !usage || usage.error) return;
-    observeCodexCredits(account, usage.credits ?? null);
+    this._observeCodexCredits(account, usage.credits ?? null);
     // The Codex-learned fields below are written here for the first time, so the
     // empty-quota shape does not carry them. See CodexLearnedQuota.
     /** @type {typeof account.quota & CodexLearnedQuota} */
@@ -8000,7 +8008,7 @@ export class AccountManager {
         switchThreshold: a.switchThreshold ?? null,
         allowExtraUsage: a.allowExtraUsage === true,
         preferExtraUsage: a.preferExtraUsage === true,
-        codexCredits: a.codexCredits ? { ...a.codexCredits } : null,
+        codexCredits: codexCreditStatus(a),
         // True while this account is the extra-usage fallback — serving past
         // its quota and billing for it. The one state `unavailable` alone
         // cannot tell apart from an account that is simply out.

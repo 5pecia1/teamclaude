@@ -28,6 +28,33 @@ test('headers and usage payloads parse the same balance without coercing missing
   assert.equal(normalizeCodexCredits({ balance: '-1.5' }).balance, -1.5);
 });
 
+test('an automatic limit waits for a verified positive balance and stays fixed', () => {
+  const a = { quota: {}, codexCredits: codexCreditPolicy({ provider: 'codex', type: 'oauth', codexCredits: false }) };
+  const now = 100_000;
+  observeCodexCredits(a, reading(300), now);
+  assert.equal(a.quota.codexAutoCreditBudget, undefined, 'off does not start a budget');
+  a.codexCredits = codexCreditPolicy({ provider: 'codex', type: 'oauth', codexCredits: true });
+  for (const unverified of [
+    null, reading(0), reading(-1), reading(null), reading(Infinity),
+    { ...reading(300), hasCredits: null }, { ...reading(300), unlimited: true },
+  ]) {
+    assert.equal(observeCodexCredits(a, unverified, now), false);
+    assert.equal(codexCreditsAvailable(a, now), false);
+    assert.equal(a.quota.codexAutoCreditBudget, undefined);
+  }
+
+  assert.equal(observeCodexCredits(a, reading(250), now), true);
+  assert.equal(codexCreditsAvailable(a, now), true);
+  assert.equal(codexCreditsAvailable(a, now + CODEX_CREDIT_MAX_AGE_MS + 1), false);
+  observeCodexCredits(a, reading(200), now + 1);
+  observeCodexCredits(a, reading(500), now + 2);
+  assert.deepEqual(a.quota.codexAutoCreditBudget, {
+    maxUsage: 250, used: 50, lastBalance: 500, startedAt: now,
+  });
+  observeCodexCredits(a, reading(300), now + 3);
+  assert.equal(codexCreditsAvailable(a, now + 3), false, 'a remaining balance cannot raise the fixed limit');
+});
+
 test('observed decreases accumulate; top-ups, disable/re-enable and a limit edit do not refund usage', () => {
   const a = account();
   const now = Date.now();

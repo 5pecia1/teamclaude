@@ -1,4 +1,4 @@
-# Raspberry Pi: Codex credit-budget fork
+# TeamClaude on Raspberry Pi
 
 This fork is distributed as a portable JavaScript archive, not a standalone native executable.
 It has no runtime npm dependencies or native addons. Install **Node.js 20 or later** for your OS/CPU first;
@@ -13,64 +13,87 @@ node --version
 node -p 'process.arch'
 ```
 
-## Download and run
+## Install a GitHub release
 
-Use the fork's release asset, **not** `npm install -g @karpeleslab/teamclaude`, which installs upstream without this feature.
-The archive contains a `package/` directory. No `npm install` or compilation is needed after extraction.
+Run this as the user who owns `teamclaude.service`. It checks the archive and points a stable `current`
+symlink at the installed version. Future upgrades use the same block with the new version number.
 
 ```sh
-version=1.1.28-codex.1
-mkdir -p "$HOME/.local/share/teamclaude-$version"
-cd "$HOME/.local/share/teamclaude-$version"
-base="https://github.com/5pecia1/teamclaude/releases/download/v$version"
-curl -fLO "$base/teamclaude-$version.tgz"
-curl -fLO "$base/SHA256SUMS"
-sha256sum -c SHA256SUMS && tar -xzf "teamclaude-$version.tgz"
-# Continue only if checksum verification and extraction succeeded.
-export TEAMROUTER_DISABLE_AUTOUPDATE=1
-node package/src/index.js --version
-node package/src/index.js help
-node package/src/index.js login --codex
-node package/src/index.js server
+(
+  set -eu
+  version=1.1.31-codex.2
+  root="$HOME/.local/share/teamclaude"
+  base="https://github.com/5pecia1/teamclaude/releases/download/v$version"
+  mkdir -p "$root"
+  stage=$(mktemp -d "$root/.install.XXXXXX")
+  trap 'rm -rf -- "$stage"' EXIT
+  cd "$stage"
+  curl -fsSLO "$base/teamclaude-$version.tgz"
+  curl -fsSLO "$base/SHA256SUMS"
+  sha256sum -c SHA256SUMS
+  mkdir "$version"
+  tar -xzf "teamclaude-$version.tgz" -C "$version"
+  if [ ! -e "$root/$version" ]; then
+    mv -T "$version" "$root/$version"
+  fi
+  test "$(node "$root/$version/package/src/index.js" --version)" = "$version"
+  ln -s "$version" "$stage/current"
+  mv -Tf "$stage/current" "$root/current"
+)
 ```
 
-Run as your normal user, not root. Headless OAuth login and existing Codex credentials are described in
-[accounts](accounts.md#codex-accounts-experimental). The `TEAMROUTER_DISABLE_AUTOUPDATE=1` environment setting should also be present
-in any shell or service that starts this fork. Set `"autoUpdate": false` in the config as an additional safeguard.
-Do **not** run the built-in `update` command: it targets upstream npm, not this GitHub fork.
-To upgrade, stop the server, download the next fork release into a new versioned directory, and start that copy.
+Use the fork's GitHub release archive for updates. The built-in `teamclaude update` points to the upstream
+npm package.
 
-For a service, use the absolute path to your Node.js executable and the extracted `package/src/index.js`;
-do not rely on an interactive shell's NVM PATH. Keep the same config path across upgrades.
+## Point the existing systemd user service at the fork
 
-## Configure the budget
+Run these commands once to inspect the current unit and open its override file.
 
-Merge these top-level settings into your existing config; do not replace your credentials or other settings:
+```sh
+systemctl --user cat teamclaude.service
+systemctl --user edit teamclaude.service
+```
+
+Add the following to the override. Keep the Node.js executable path from your current `ExecStart`; the
+example uses `/usr/bin/node`. Carry over any custom server arguments. The config environment and other
+service settings stay in the original unit.
+
+```ini
+[Service]
+Environment=TEAMROUTER_DISABLE_AUTOUPDATE=1
+ExecStart=
+ExecStart=/usr/bin/node "%h/.local/share/teamclaude/current/package/src/index.js" server --headless
+```
+
+For a foreground start without systemd, run
+`TEAMROUTER_DISABLE_AUTOUPDATE=1 node "$HOME/.local/share/teamclaude/current/package/src/index.js" server`.
+See [Codex accounts](accounts.md#codex-accounts-experimental) for headless OAuth login.
+
+## Turn on the automatic budget
+
+Add this to each Codex OAuth account you want to enable in the existing config's `accounts` array:
 
 ```json
-{
-  "autoUpdate": false,
-  "quotaProbeSeconds": 60
-}
+"codexCredits": true
 ```
 
-Add the following object to **each Codex OAuth account you want to limit** in `accounts`:
+The config usually lives at `~/.config/teamclaude.json`. An existing `teamrouter.json`, `XDG_CONFIG_HOME`,
+or a service override via `TEAMROUTER_CONFIG` or `TEAMCLAUDE_CONFIG` can change the path. Keep the config and
+its adjacent state file in place across upgrades.
 
-```json
-"codexCredits": {
-  "enabled": true,
-  "maxUsage": 100,
-  "budgetId": "rpi-budget-1"
-}
+The first verified positive balance sets the limit. Set `codexCredits` to `false` to allow only confirmed
+included quota. The account keeps its automatic limit and accumulated usage when you turn it back on.
+Existing manual limits remain available. See [Codex credit budget](quota.md#codex-credit-budget).
+
+## Restart and verify
+
+```sh
+systemctl --user daemon-reload
+systemctl --user restart teamclaude.service
+systemctl --user status teamclaude.service --no-pager
+node "$HOME/.local/share/teamclaude/current/package/src/index.js" status --json
 ```
 
-The default config is normally `~/.config/teamclaude.json`; `teamrouter.json`, `XDG_CONFIG_HOME`, or an explicit
-`TEAMROUTER_CONFIG` / `TEAMCLAUDE_CONFIG` can change it. Keep the adjacent state file: it stores consumed budgets.
-Deleting it loses the budget history. A missing policy preserves legacy routing, so it is not a fleet-wide cap.
-
-`maxUsage` counts observed credit-balance decreases, not dollars or monthly spend. The same `budgetId` preserves
-usage across restarts and limit changes. Changing the ID starts a new budget. Included quota is preferred before
-paid fallback; stale or unknown credit readings and state-save failures block paid dispatch.
-
-Concurrent requests and other clients can cause overshoot; top-ups between readings can hide consumption.
-This is not an upstream hard billing cap. See [Codex credit budget](quota.md#codex-credit-budget) for details.
+Use the service's Node.js binary and config environment for the status command if they differ from your shell.
+The response reports the running server version and the account's `codexCredits` settings, fixed limit, and
+cumulative usage. For later upgrades, install the new release and run `systemctl --user restart teamclaude.service`.

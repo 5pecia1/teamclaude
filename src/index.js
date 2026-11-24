@@ -760,7 +760,7 @@ async function serverCommand() {
       if (ms !== prober.intervalMs) {
         config.quotaProbeSeconds = diskConfig.quotaProbeSeconds || 0;
         prober.reschedule(ms);
-      }
+      } else prober.syncAutoCreditProbes();
     }
     if (warmer) {
       const diskSchedule = diskConfig.warmupSchedule || null;
@@ -1150,7 +1150,7 @@ async function serverCommand() {
   // WAL checkpoint + retention sweep; a no-op timer when the store is disabled.
   startTicks(usageStore);
 
-  // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
+  // Start the fleet probe and reads required by boolean Codex credit policies.
   prober = new Prober(accountManager, {
     intervalMs: (config.quotaProbeSeconds || 0) * 1000,
     profileFn: fetchProfile,

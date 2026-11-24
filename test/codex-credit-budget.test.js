@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
+import { AUTO_CREDIT_PROBE_INTERVAL_MS, Prober } from '../src/prober.js';
 import { syncAccountsFromDisk } from '../src/sync-accounts.js';
 import { CODEX_CREDIT_MAX_AGE_MS } from '../src/codex-credits.js';
 import { resolveUpstreamProxy, resetUpstreamProxy, setUpstreamProxy } from '../src/upstream-proxy.js';
@@ -63,7 +64,11 @@ function seedBalance(am, balance) {
   setQuota(am.accounts[0], 1);
 }
 
-async function startProxy({ responseBalance = 1.25, maxUsage = 0.75, persistCreditState }) {
+async function startProxy({
+  responseBalance = 1.25, maxUsage = 0.75,
+  codexCredits = { enabled: true, maxUsage, budgetId: 'budget-1' },
+  persistCreditState,
+}) {
   let upstreamCalls = 0;
   const upstream = http.createServer((_req, res) => {
     upstreamCalls++;
@@ -73,7 +78,7 @@ async function startProxy({ responseBalance = 1.25, maxUsage = 0.75, persistCred
   const upstreamPort = await listen(upstream);
   const am = new AccountManager([oauth('codex', {
     upstream: `http://127.0.0.1:${upstreamPort}`,
-    codexCredits: { enabled: true, maxUsage, budgetId: 'budget-1' },
+    codexCredits,
   })], 0.98);
   seedBalance(am, 2);
   am.persistCreditState = persistCreditState;
@@ -214,6 +219,125 @@ test('disk reload toggles and mirrors raw policy without resetting a matching bu
   assert.equal(am.accounts[0].codexCredits, null);
   assert.equal(mem.accounts[0].codexCredits, undefined);
   assert.equal(am.accounts[0].quota.codexCreditBudget.used, 1.625);
+});
+
+test('automatic and manual budgets survive mode changes and account-matched restart', async () => {
+  const manual = { enabled: true, maxUsage: 10, budgetId: 'budget-1' };
+  const entry = oauth('codex', { codexCredits: manual });
+  const disk = { accounts: [{ ...entry }] };
+  const mem = { accounts: [{ ...entry }] };
+  const am = new AccountManager(mem.accounts, 0.98);
+  seedBalance(am, 255);
+  seedBalance(am, 250);
+
+  async function reload(policy) {
+    disk.accounts[0].codexCredits = policy;
+    await syncAccountsFromDisk(disk, mem, am);
+    assert.deepEqual(mem.accounts[0].codexCredits, policy);
+  }
+
+  await reload(true);
+  assert.deepEqual(am.getStatus().accounts[0].codexCredits, {
+    automatic: true, enabled: true, waitingForBalance: true, maxUsage: null, used: null,
+  });
+  seedBalance(am, 250);
+  seedBalance(am, 225);
+  await reload(false);
+  assert.equal(am.unavailableReason(am.accounts[0], MODEL), 'credit-capped');
+  seedBalance(am, 200);
+  seedBalance(am, 400);
+  await reload(manual);
+  assert.equal(am.accounts[0].quota.codexCreditBudget.used, 5);
+  await reload(true);
+
+  const saved = am.exportQuotaState();
+  const restored = new AccountManager([{ ...entry, name: 'renamed', codexCredits: true }], 0.98);
+  restored.restoreQuotaState(saved);
+  assert.equal(restored.accounts[0].quota.codexCredits, undefined);
+  assert.equal(restored.getStatus().accounts[0].codexCredits.waitingForBalance, true);
+  assert.equal(restored.unavailableReason(restored.accounts[0], MODEL), 'credit-capped');
+  seedBalance(restored, 390);
+  assert.deepEqual(restored.getStatus().accounts[0].codexCredits, {
+    automatic: true, enabled: true, waitingForBalance: false, maxUsage: 250, used: 60,
+  });
+  assert.equal(restored.accounts[0].quota.codexCreditBudget.used, 5);
+});
+
+test('boolean policies get scoped startup, reload and periodic reads with fleet probes off', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const accounts = [
+    oauth('on', { codexCredits: true }),
+    oauth('off', { codexCredits: false }),
+    oauth('legacy'),
+    oauth('disabled', { codexCredits: true, disabled: true }),
+  ];
+  const mem = { accounts: accounts.map(account => ({ ...account })) };
+  const disk = { accounts };
+  const am = new AccountManager(mem.accounts, 0.98);
+  const probes = [];
+  const initialSaves = [];
+  am.persistCreditState = async () => {
+    initialSaves.push(JSON.parse(JSON.stringify(am.exportQuotaState())));
+  };
+  let balance = 0;
+  const prober = new Prober(am, {
+    codexProbeFn: async account => {
+      probes.push(account.name);
+      return {
+        credits: { hasCredits: balance > 0, unlimited: false, balance },
+        fiveHour: { utilization: 0.5 },
+        sevenDay: { utilization: 0.5 },
+      };
+    },
+  });
+  t.after(() => prober.stop());
+  prober.start();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(probes, ['on', 'off']);
+  assert.equal(am.getStatus().accounts[0].codexCredits.waitingForBalance, true);
+  assert.equal(am.unavailableReason(am.accounts[1], MODEL), null, 'off still confirms included quota');
+  assert.equal(initialSaves.length, 0);
+
+  balance = 250;
+  t.mock.timers.tick(AUTO_CREDIT_PROBE_INTERVAL_MS);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(probes, ['on', 'off', 'on', 'off']);
+  assert.equal(initialSaves[0][0].quota.codexAutoCreditBudget.maxUsage, 250);
+  assert.equal(am.accounts[1].quota.codexAutoCreditBudget, undefined);
+
+  disk.accounts[1].codexCredits = true;
+  await syncAccountsFromDisk(disk, mem, am);
+  prober.syncAutoCreditProbes();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(probes, ['on', 'off', 'on', 'off', 'off']);
+  assert.equal(initialSaves[1][1].quota.codexAutoCreditBudget.maxUsage, 250);
+});
+
+test('a paid automatic request waits for a successful save and pins honor its cap', async () => {
+  const snapshots = [];
+  let saveFails = true;
+  const harness = await startProxy({
+    codexCredits: true,
+    responseBalance: 0,
+    persistCreditState: async () => {
+      if (saveFails) throw new Error('state write failed');
+      snapshots.push(JSON.parse(JSON.stringify(harness.am.exportQuotaState())));
+    },
+  });
+  try {
+    assert.equal(await post(harness.proxyPort), 503);
+    assert.equal(harness.upstreamCalls, 0);
+    saveFails = false;
+    assert.equal(await post(harness.proxyPort), 200);
+    assert.equal(snapshots[0][0].quota.codexAutoCreditBudget.maxUsage, 2);
+    assert.equal(snapshots[0][0].quota.codexAutoCreditBudget.used, 0);
+    assert.equal(harness.am.accounts[0].quota.codexAutoCreditBudget.used, 2);
+    seedBalance(harness.am, 500);
+    assert.equal(await post(harness.proxyPort, '/tc-acct/codex/backend-api/codex/responses'), 429);
+    assert.equal(harness.upstreamCalls, 1);
+  } finally {
+    await harness.close();
+  }
 });
 
 test('paid proxy dispatch requires durable persistence; caps and save failures send nothing', async () => {
