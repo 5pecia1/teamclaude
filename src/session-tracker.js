@@ -157,6 +157,33 @@ function setAndReturn(map, key, value) {
  * @property {string|null} provider the fleet whose reading this is
  * @property {Map<string, number>|null} handedBack the account's windows as they stood when a hold handed this reading back, so the roll it was handed back for is not held again; null once the reading moves
  */
+/** @typedef {{id: string, provider: string}} AffinityAccount */
+/** @typedef {{bucket: string, account: AffinityAccount, at: number}} AffinityPin */
+/** @typedef {{key: string, sessionId: string|null, conversation: string|null, lastSeen: number, pins: AffinityPin[], threads: string[]}} AffinitySession */
+/** @param {unknown} value @param {number} limit @returns {value is string} */
+const boundedString = (value, limit) => typeof value === 'string' && value.length > 0 && value.length <= limit;
+/** @param {unknown} value @returns {value is number} */
+const affinityTime = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+// Bounds on what one saved conversation may bring back. A bucket key is the
+// name of a quota field, and a conversation holds one pin per weekly bucket it
+// has spent, so both limits sit far above anything the tracker writes. They are
+// for a damaged file, which must not restore more than a live record can hold.
+const MAX_BUCKET_LENGTH = 128;
+export const MAX_AFFINITY_PINS = 64;
+/** @param {any} row @returns {row is AffinitySession} */
+function affinityRow(row) {
+  return row != null && boundedString(row.key, MAX_KEY_LENGTH)
+    && (row.sessionId === null || boundedString(row.sessionId, MAX_SESSION_ID_LENGTH))
+    && (row.conversation === null || boundedString(row.conversation, 22))
+    && affinityTime(row.lastSeen)
+    && Array.isArray(row.pins) && Array.isArray(row.threads);
+}
+/** @param {any} ref @returns {ref is AffinityAccount} */
+function affinityAccount(ref) {
+  return ref != null && typeof ref.id === 'string' && !!ref.id
+    && typeof ref.provider === 'string' && !!ref.provider;
+}
+
 export class SessionTracker {
   /**
    * @param {Object} [opts]
@@ -174,12 +201,77 @@ export class SessionTracker {
     this._routedCounts = new Map();
     // id -> { pins: Map<bucketKey, { idx, at }>,
     //         refs: Map<bucketKey, Observation>,
-    //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
+    //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...>,
+    //         model: the model of the last request routed for it, or null }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
     this.activeTtlMs = activeTtlMs ?? SESSION_ACTIVE_TTL_MS;
     this._now = now || (() => Date.now());
     this._lastSweep = 0;
+  }
+
+  // Explicit allowlist: routing knowledge only. Neither live requests nor their
+  // labels, spend and rollover observations belong in a restart snapshot.
+  /** @param {(index: number) => AffinityAccount|null} identifyAccount @param {number} [now] */
+  exportAffinity(identifyAccount, now = this._now()) {
+    /** @type {AffinitySession[]} */
+    const sessions = [];
+    for (const [key, s] of this.sessions) {
+      if (this._isExpired(s, now)) continue;
+      const pins = [];
+      for (const [bucket, pin] of s.pins) {
+        const account = identifyAccount(pin.idx);
+        if (pins.length < MAX_AFFINITY_PINS && affinityAccount(account) && boundedString(bucket, MAX_BUCKET_LENGTH) && affinityTime(pin.at)) {
+          pins.push({ bucket, account: { id: account.id, provider: account.provider }, at: pin.at });
+        }
+      }
+      const threads = [...s.threads];
+      const row = { key, sessionId: s.sessionId, conversation: s.conversation, lastSeen: s.inFlight > 0 ? Math.max(s.lastSeen, now) : s.lastSeen, pins, threads };
+      if ((pins.length || threads.length) && affinityRow(row)) sessions.push(row);
+    }
+    sessions.sort((a, b) => b.lastSeen - a.lastSeen);
+    return { version: 1, sessions: sessions.slice(0, MAX_SESSIONS) };
+  }
+
+  // Keys are opaque, as on ingress. Owner metadata is independent: some keys
+  // carry no client session or conversation, and must still retain their pins.
+  //
+  // No saved time is taken as later than `now`. A time ahead of the clock, from
+  // a clock stepped back between the save and this start or from a damaged
+  // file, would otherwise never reach its idle expiry and would be the last
+  // record evicted at the cap. Clamped, it is read as "seen just now", which is
+  // the longest a restored record can be owed.
+  /** @param {any} snapshot @param {(account: AffinityAccount) => number|null} resolveAccount @param {number} [now] */
+  restoreAffinity(snapshot, resolveAccount, now = this._now()) {
+    if (snapshot?.version !== 1 || !Array.isArray(snapshot.sessions)) return;
+    /** @type {Array<{row: AffinitySession, lastSeen: number}>} */
+    const rows = [];
+    for (const row of snapshot.sessions) {
+      if (!affinityRow(row)) continue;
+      const lastSeen = Math.min(row.lastSeen, now);
+      if (!this._isExpired({ lastSeen, inFlight: 0 }, now)) rows.push({ row, lastSeen });
+    }
+    rows.sort((a, b) => b.lastSeen - a.lastSeen);
+    for (const { row, lastSeen } of rows) {
+      if (this.sessions.size >= MAX_SESSIONS) break;
+      if (this.sessions.has(row.key)) continue;
+      const pins = new Map();
+      for (const pin of row.pins) {
+        if (pins.size >= MAX_AFFINITY_PINS) break;
+        if (!pin || !boundedString(pin.bucket, MAX_BUCKET_LENGTH) || pins.has(pin.bucket)
+            || !affinityAccount(pin.account) || !affinityTime(pin.at)) continue;
+        const idx = resolveAccount(pin.account);
+        if (idx != null && Number.isInteger(idx) && idx >= 0) pins.set(pin.bucket, { idx, at: Math.min(pin.at, now) });
+      }
+      // The newest ids are last, as recordThreadMessage leaves them.
+      const threads = new Set(row.threads.filter(isMessageId).slice(-MAX_THREAD_MESSAGES));
+      if (!pins.size && !threads.size) continue;
+      const s = this._ensure(row.key, lastSeen);
+      s.sessionId = row.sessionId;
+      s.conversation = row.conversation;
+      s.pins = pins;
+      s.threads = threads;
+    }
   }
 
   // Record that `sessionId` made a request served by `accountIndex`, spending
@@ -462,6 +554,7 @@ export class SessionTracker {
         conversation: null,
         client: null,
         dimensions: null,
+        model: null,
       };
       this.sessions.set(sessionId, s);
     }
@@ -579,6 +672,26 @@ export class SessionTracker {
       return [];
     }
     return [...s.pins.values()].sort((a, b) => b.at - a.at).map(p => p.idx);
+  }
+
+  // Delete every pin naming this account, on the operator's say-so (`teamclaude
+  // release`): each conversation is placed again on its next request. Answers how
+  // many live conversations held one. Their rollover observations stay, since
+  // those are about the account and not about the pin.
+  /** @param {number} accountIndex */
+  releaseAccount(accountIndex, now = this._now()) {
+    let released = 0;
+    for (const s of this.sessions.values()) {
+      if (this._isExpired(s, now)) continue;
+      let held = false;
+      for (const [bucket, pin] of [...s.pins]) {
+        if (pin.idx !== accountIndex) continue;
+        s.pins.delete(bucket);
+        held = true;
+      }
+      if (held) released++;
+    }
+    return released;
   }
 
   // Re-point every pin through `mapFn` after the account list is renumbered (see
@@ -736,6 +849,29 @@ export class SessionTracker {
       if (id === sessionId || s.sessionId === sessionId) return true;
     }
     return false;
+  }
+
+  // Every live conversation of a client session, matched the way knowsSession
+  // matches: a readout row plus its routed model and the bucket of its newest
+  // pin, which the status payload leaves out. A scan, for the control plane only.
+  /** @param {string|null} sessionId */
+  conversationsOf(sessionId, now = this._now()) {
+    if (!sessionId) return [];
+    const out = [];
+    for (const [id, s] of this.sessions) {
+      if (this._isExpired(s, now)) continue;
+      if (id !== sessionId && s.sessionId !== sessionId) continue;
+      let pinBucket = null;
+      let at = -Infinity;
+      for (const [bucket, pin] of s.pins) {
+        if (pin.at > at) {
+          at = pin.at;
+          pinBucket = bucket;
+        }
+      }
+      out.push({ ...sessionItem(id, s, this._isActive(s, now)), model: s.model, pinBucket });
+    }
+    return out;
   }
 
   // Drop sessions idle longer than the known window (but never one still in flight).

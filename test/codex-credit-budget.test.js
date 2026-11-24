@@ -131,8 +131,35 @@ test('stale and unknown credit readings cannot authorize paid fallback', () => {
     am._nextProbeAt = 0;
 
     assert.equal(am._selectProbe(null, MODEL), null, reading);
+    assert.equal(am.unavailableReason(am.accounts[0], MODEL), 'credit-capped', reading);
+    assert.equal(am.fallbackTier(am.accounts[0], MODEL), null, reading);
     assert.equal(am.getActiveAccount(null, MODEL, null, null, 'codex'), null, reading);
   }
+});
+
+test('utilization under 1.0 is still a paid credit fallback when included quota is unproven', () => {
+  const am = new AccountManager([oauth('budget', {
+    codexCredits: { enabled: true, maxUsage: 10, budgetId: 'budget-1' },
+  })], 0.98);
+  am.updateQuota(0, creditHeaders(20), MODEL, 200);
+  am._nextProbeAt = Date.now() + 60_000;
+
+  assert.equal(am.unavailableReason(am.accounts[0], MODEL), 'quota');
+  assert.equal(am.fallbackTier(am.accounts[0], MODEL), 'paid');
+  assert.deepEqual(am._pickFallback(null, MODEL, 'codex'), { account: am.accounts[0], paid: true });
+  assert.equal(am.getActiveAccount(null, MODEL, null, null, 'codex'), am.accounts[0]);
+});
+
+test('a disabled credit policy stays credit-capped and is not a paid fallback', () => {
+  const am = new AccountManager([oauth('budget', {
+    codexCredits: { enabled: false, maxUsage: 10, budgetId: 'budget-1' },
+  })], 0.98);
+  am.updateQuota(0, creditHeaders(20), MODEL, 200);
+  am._nextProbeAt = Date.now() + 60_000;
+
+  assert.equal(am.unavailableReason(am.accounts[0], MODEL), 'credit-capped');
+  assert.equal(am.fallbackTier(am.accounts[0], MODEL), null);
+  assert.equal(am.getActiveAccount(null, MODEL, null, null, 'codex'), null);
 });
 
 test('credit budget survives identity-matched restore and counts decreases after downtime', () => {
@@ -180,6 +207,12 @@ test('disk reload toggles and mirrors raw policy without resetting a matching bu
   disk.accounts[0].codexCredits = { enabled: true, maxUsage: 2.5, budgetId: 'budget-1' };
   await syncAccountsFromDisk(disk, mem, am);
   assert.deepEqual(am.accounts[0].codexCredits, disk.accounts[0].codexCredits);
+  assert.equal(am.accounts[0].quota.codexCreditBudget.used, 1.625);
+
+  delete disk.accounts[0].codexCredits;
+  await syncAccountsFromDisk(disk, mem, am);
+  assert.equal(am.accounts[0].codexCredits, null);
+  assert.equal(mem.accounts[0].codexCredits, undefined);
   assert.equal(am.accounts[0].quota.codexCreditBudget.used, 1.625);
 });
 

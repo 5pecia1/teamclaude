@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, creditText } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml() {
@@ -291,6 +291,10 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   ];
   if (isCurrent) badges.push({ cls: 'current', text: 'current' });
   badges.push({ cls: status, text: status });
+  // Cordoned: no new conversation goes here while the ones on it stay, with
+  // how many are left — what an operator waits to see reach 0 before a
+  // disable or a removal.
+  if (a.cordoned === true) badges.push({ cls: 'cordoned', text: 'cordoned' + (Number.isFinite(a.cordonRemaining) ? ' · ' + a.cordonRemaining + ' left' : '') });
   if (recent) badges.push({ cls: 'sessions', text: recent + ' recent' });
   if (known > recent) badges.push({ cls: 'sessions known', text: known + ' known' });
   // Free Codex rate-limit reset credits this account holds — what it could
@@ -303,14 +307,34 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   var credits = reading.available;
   var at = now == null ? Date.now() : now;
   var stale = Number.isFinite(reading.seenAt) && at - reading.seenAt > RESET_CREDIT_MAX_AGE_MS;
-  // A Claude banked reset states when it lapses: drop it past then, and say
-  // the date while it stands (the claude.ai Resets page names it the same way).
-  var expired = Number.isFinite(reading.expiresAt) && reading.expiresAt <= at;
-  if (Number.isFinite(credits) && credits > 0 && !stale && !expired) {
-    var expires = Number.isFinite(reading.expiresAt)
-      ? ' \u00b7 expires ' + new Date(reading.expiresAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-      : '';
-    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') + expires });
+  if (Number.isFinite(credits) && credits > 0 && !stale) {
+    // Fable resets (oauth.js bankedResets) clear the Fable weekly only, so they
+    // are named apart from the resets that put every model back.
+    var fable = Number.isFinite(reading.fable) ? Math.min(Math.max(reading.fable, 0), credits) : 0;
+    var general = credits - fable;
+    // A Claude banked reset states when it lapses: drop it past then, and say
+    // the date while it stands (the claude.ai Resets page names it the same way).
+    // The two kinds are dated apart; a reading without `fableExpiresAt` has one
+    // date for all it holds (status-renderer.js heldResetKinds, same rule).
+    var generalEnds = Number.isFinite(reading.expiresAt) ? reading.expiresAt : null;
+    var fableEnds = 'fableExpiresAt' in reading
+      ? (Number.isFinite(reading.fableExpiresAt) ? reading.fableExpiresAt : null)
+      : generalEnds;
+    if (generalEnds != null && generalEnds <= at) general = 0;
+    if (fableEnds != null && fableEnds <= at) fable = 0;
+    /** @param {string} text @param {number|null} ends */
+    var dated = function (text, ends) {
+      return ends == null ? text
+        : text + ' \u00b7 expires ' + new Date(ends).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    };
+    var held = [];
+    if (general > 0) held.push(general + ' reset credit' + (general === 1 ? '' : 's'));
+    if (fable > 0) held.push(fable + ' Fable reset' + (fable === 1 ? '' : 's'));
+    if (general > 0 && fable > 0 && generalEnds !== fableEnds) {
+      badges.push({ cls: 'meta', text: dated(held[0], generalEnds) + ', ' + dated(held[1], fableEnds) });
+    } else if (held.length) {
+      badges.push({ cls: 'meta', text: dated(held.join(', '), general > 0 ? generalEnds : fableEnds) });
+    }
   }
   // Arguments 5/6 are optional (the pre-#409 unit test above omits them): with
   // no account switchThreshold at all — the common case — thresholdBadgeText
@@ -485,21 +509,24 @@ export function thresholdOutcome(res) {
  * move, or {disabled} to take an account out of rotation or put it back.
  *
  * @param {any} name
- * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ * @param {{ place?: string, priority?: number, disabled?: boolean, cordoned?: boolean }} spec
  * @param {string|null} key
  */
 export function accountControlRequest(name, spec, key) {
-  var isPriority = spec.disabled === undefined;
-  /** @type {{ account: any, place?: any, priority?: any, disabled?: any }} */
+  var isCordon = spec.cordoned !== undefined;
+  var isPriority = spec.disabled === undefined && !isCordon;
+  /** @type {{ account: any, place?: any, priority?: any, disabled?: any, cordoned?: any }} */
   var body = { account: name };
   if (isPriority) {
     if (spec.place) body.place = spec.place;
     else body.priority = spec.priority;
+  } else if (isCordon) {
+    body.cordoned = spec.cordoned;
   } else {
     body.disabled = spec.disabled;
   }
   return {
-    url: isPriority ? '/teamclaude/priority' : '/teamclaude/disable',
+    url: isPriority ? '/teamclaude/priority' : isCordon ? '/teamclaude/account-cordon' : '/teamclaude/disable',
     init: {
       method: 'POST',
       headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
@@ -514,12 +541,22 @@ export function accountControlRequest(name, spec, key) {
  * 'first' or 'last'.
  *
  * @param {any} res
- * @param {{ place?: string, priority?: number, disabled?: boolean }} spec
+ * @param {{ place?: string, priority?: number, disabled?: boolean, cordoned?: boolean }} spec
  */
 export function accountControlOutcome(res, spec) {
   if (!res || !res.ok) return { kind: 'error', text: 'change failed' + (res && res.error ? ': ' + res.error : '') };
   if (spec.disabled !== undefined) {
     return { kind: 'ok', text: (res.disabled ? 'disabled ' : 'enabled ') + res.name };
+  }
+  // A cordon reports what it leaves running, which is what an operator waits
+  // on, and warns when no other account is left to take new conversations.
+  if (spec.cordoned !== undefined) {
+    if (!res.cordoned) return { kind: 'ok', text: 'uncordoned ' + res.name + ': it takes new conversations again' };
+    var left = Number.isFinite(res.remaining) ? res.remaining : null;
+    var text = 'cordoned ' + res.name + ': no new conversations'
+      + (left == null ? '' : ', ' + left + ' still on it' + (left === 0 ? ', so disabling or removing it ends nothing running' : ''));
+    if (res.inService === 0) return { kind: 'warn', text: text + '; no other account takes new conversations now' };
+    return { kind: 'ok', text: text };
   }
   return { kind: 'ok', text: res.name + ' priority ' + res.priority };
 }
@@ -767,6 +804,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, accountGroups, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
+  creditText,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -829,7 +867,7 @@ const PAGE = `<!doctype html>
   .tag { font-size: 12px; color: var(--dim); }
   .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); }
   .badge.active { color: var(--ok); border-color: var(--ok); }
-  .badge.throttled { color: var(--warn); border-color: var(--warn); }
+  .badge.throttled, .badge.cordoned { color: var(--warn); border-color: var(--warn); }
   .badge.error, .badge.exhausted { color: var(--bad); border-color: var(--bad); }
   .badge.current { color: var(--accent); border-color: var(--accent); }
   .badge.provider { color: var(--text); }
@@ -1099,7 +1137,20 @@ ${SHARED_HELPERS}
       ctlDisable.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { disabled: !a.disabled }, ctlDisable); });
       head.appendChild(ctlDisable);
     }
-    if (!a.disabled && callerCan(caller, '/teamclaude/priority')) {
+    // Cordon it, or put it back: no new conversation goes to it while the
+    // ones already on it stay, the graceful step before a disable or a
+    // removal. Drawn on a disabled card too, so an enable can bring it back
+    // cordoned.
+    if (callerCan(caller, '/teamclaude/account-cordon')) {
+      var ctlCordon = el('button', 'act', a.cordoned === true ? 'uncordon' : 'cordon');
+      ctlCordon.title = a.cordoned === true ? 'Send new conversations to this account again'
+        : 'Send no new conversations to this account; the ones on it stay until they finish';
+      ctlCordon.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { cordoned: !(a.cordoned === true) }, ctlCordon); });
+      head.appendChild(ctlCordon);
+    }
+    // Not on a cordoned card either: nothing new goes there, so a move would
+    // read as doing something and would not, until the uncordon.
+    if (!a.disabled && a.cordoned !== true && callerCan(caller, '/teamclaude/priority')) {
       var ctlFirst = el('button', 'act', 'prioritize');
       ctlFirst.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { place: 'first' }, ctlFirst); });
       head.appendChild(ctlFirst);
@@ -1108,7 +1159,8 @@ ${SHARED_HELPERS}
       head.appendChild(ctlLast);
     }
     card.appendChild(head);
-    if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
+    // A cordon is the badge's to say: the account still serves what is on it.
+    if (a.unavailable && a.unavailable !== 'cordoned') card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
     if (a.entitlementDenial) card.appendChild(el('div', 'blocked', 'denied: ' + (a.entitlementDenial.detail || 'OAuth entitlement denied') + ' \u00b7 first ' + fmtAgo(a.entitlementDenial.since)));
     var q = a.quota || {};
     var models = modelsRow(a.usage);
@@ -1132,6 +1184,14 @@ ${SHARED_HELPERS}
       card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
     }
     if (models) card.appendChild(models);
+    // Prepaid API credit (accounts[].credit): the share of it spent this
+    // cycle as a bar, its renewal as the bar's countdown, and the amount left
+    // with where the figure comes from — the same words the status command prints.
+    if (a.credit) {
+      card.appendChild(quotaRow('Credit', a.credit.usedFraction, a.credit.cycleEnd));
+      var creditLine = creditText(a.credit, Date.now());
+      if (creditLine) card.appendChild(el('div', 'usage', 'credit: ' + creditLine));
+    }
     // Spend on this account that did not come through the proxy (#475).
     var outside = outsideSpendText(q.outsideSpend);
     if (outside) card.appendChild(el('div', 'usage', 'outside: ' + outside));
