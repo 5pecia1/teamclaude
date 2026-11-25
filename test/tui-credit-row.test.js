@@ -4,6 +4,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { TUI, creditTag } from '../src/tui.js';
 import { RemoteAccountManager } from '../src/tui-remote.js';
 import { CreditMonitor, sanitizeCreditView } from '../src/api-credit.js';
+import { observeCodexCredits } from '../src/codex-credits.js';
 
 // An API-key row with prepaid credit (accounts[].credit) draws a Cr bar after
 // Tok/Req and a `$X left` tag. Both are width-budgeted (#234): the row must
@@ -130,6 +131,42 @@ test('attach mode draws the same credit off the status payload, and fits', async
   const attached = renderRows(remote, 220, true).map(strip).map(tagOf);
   assert.deepEqual(attached, local);
   assert.ok(local.filter(Boolean).length >= 4);
+});
+
+test('Codex OAuth rows show budget updates live and on attach', () => {
+  const am = new AccountManager([
+    { name: 'auto', codexCredits: true },
+    { name: 'manual', codexCredits: { enabled: true, maxUsage: 100, budgetId: 'manual' } },
+    { name: 'off', codexCredits: false },
+    { name: 'plain' },
+  ].map(a => ({
+    ...a, provider: 'codex', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + H,
+  })), 0.98);
+  const remote = new RemoteAccountManager();
+  const check = (/** @type {string[]} */ tags) => {
+    remote.applyStatus(JSON.parse(JSON.stringify(am.getStatus())));
+    for (const w of WIDTHS) {
+      const local = renderRows(am, w).map(strip);
+      const attached = renderRows(remote, w, true).map(strip);
+      assert.ok(widest(attached) <= w, `W=${w}: widest attached row is ${widest(attached)} columns`);
+      const extract = (/** @type {string[]} */ rows) => rows.map(row => row.match(/\bCr (\S+)/)?.[1] ?? '');
+      assert.deepEqual(extract(local), tags, `W=${w}: local`);
+      assert.deepEqual(extract(attached), tags, `W=${w}: attached`);
+    }
+  };
+  const read = (/** @type {number} */ index, /** @type {number} */ balance) =>
+    observeCodexCredits(am.accounts[index], { hasCredits: balance > 0, unlimited: false, balance });
+
+  check(['waiting', 'waiting', '', '']);
+  read(0, 250);
+  read(0, 225);
+  read(1, 150);
+  read(1, 145);
+  check(['25/250', '5/100', '', '']);
+
+  read(0, 0);
+  am.accounts[1].quota.codexCredits.seenAt = 0;
+  check(['250/250', '5/100?', '', '']);
 });
 
 test('a hostile credit payload cannot put an escape sequence into the attached row', async () => {

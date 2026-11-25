@@ -105,21 +105,53 @@ async function post(proxyPort, path = '/backend-api/codex/responses') {
   return response.status;
 }
 
-test('near-threshold included quota wins before credit fallback while a live probe is due', () => {
+test('an opted-in paid Codex account wins over normal priority and the live probe', () => {
   const am = new AccountManager([
-    oauth('free'),
-    oauth('budget', { codexCredits: { enabled: true, maxUsage: 10, budgetId: 'budget-1' } }),
+    oauth('free', { priority: 0 }),
+    oauth('budget', { priority: 10, codexCredits: true }),
   ], 0.98);
-  setQuota(am.accounts[0], 0.99);
+  setQuota(am.accounts[0], 0.25);
   am.updateQuota(1, creditHeaders(20), MODEL, 200);
   setQuota(am.accounts[1], 1);
   am._nextProbeAt = 0;
 
-  const selected = am.getActiveAccount(null, MODEL, null, null, 'codex');
+  assert.equal(am.previewRouteIndex(MODEL, 'codex'), 1);
+  assert.equal(am.getActiveAccount(null, MODEL, null, 'session', 'codex').name, 'budget');
+  assert.equal(am.getStatus().accounts[1].onExtraUsage, true);
+  assert.equal(am.getStatus().currentAccounts.codex, 'budget');
+  assert.equal(am._nextProbeAt, 0);
+  assert.equal(am.pickAlternate(new Set([0]), MODEL, null, 'codex').name, 'budget');
+  assert.equal(am.pickAlternate(new Set([1]), MODEL, null, 'codex').name, 'free');
 
-  assert.equal(selected.name, 'free');
-  assert.ok(am._nextProbeAt > Date.now(), 'the due live probe was selected before any credit fallback');
-  assert.deepEqual(am._pickFallback(null, MODEL, 'codex'), { account: am.accounts[0], paid: false });
+  am.setRoutes([{ name: 'codex', match: MODEL }]);
+  assert.equal(am.setRoutePin('codex', 0).ok, true);
+  assert.equal(am.getActiveAccount(null, MODEL, null, 'session', 'codex').name, 'free');
+  am.clearRoutePin('codex');
+  assert.equal(am.getActiveAccount(null, MODEL, null, 'session', 'codex').name, 'budget');
+
+  am.updateQuota(1, creditHeaders(0), MODEL, 200);
+  assert.equal(am.getActiveAccount(null, MODEL, null, 'session', 'codex').name, 'free');
+  assert.equal(am.getStatus().accounts[1].onExtraUsage, false);
+});
+
+test('a credit-preferred account uses its included quota through the switch threshold', async () => {
+  const am = new AccountManager([
+    oauth('free', { priority: 0 }),
+    oauth('budget', { priority: 10, codexCredits: true }),
+  ], 0.98);
+  setQuota(am.accounts[0], 0.25);
+  am.updateQuota(1, creditHeaders(20), MODEL, 200);
+  setQuota(am.accounts[1], 0.99);
+
+  const selected = am.getActiveAccount(null, MODEL, null, null, 'codex');
+  assert.equal(selected.name, 'budget');
+  assert.equal(am.onExtraUsage(selected.index), false);
+  am.persistCreditState = async () => assert.fail('included quota does not need credit persistence');
+  assert.equal(await am.prepareCodexCreditRequest(selected, MODEL), true);
+
+  am.setRoutes([{ name: 'free-only', match: MODEL, accounts: ['free'] }]);
+  assert.equal(am.previewRouteIndex(MODEL, 'codex'), 0);
+  assert.equal(am.getActiveAccount(null, MODEL, null, null, 'codex').name, 'free');
 });
 
 test('stale and unknown credit readings cannot authorize paid fallback', () => {

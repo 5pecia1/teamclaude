@@ -125,14 +125,15 @@ export function currentCodexCreditBudget(account) {
 /** @param {Record<string, any>} account */
 export function codexCreditStatus(account) {
   const policy = account.codexCredits;
-  if (!policy?.automatic) return policy ? { ...policy } : null;
+  if (!policy) return null;
   const budget = currentCodexCreditBudget(account);
-  const resolved = validAutomaticBudget(budget) ? budget : null;
+  const automatic = policy.automatic && validAutomaticBudget(budget) ? budget : null;
+  const ledger = policy.automatic ? automatic : validCreditBudget(budget, policy.budgetId) ? budget : null;
   return {
     ...policy,
-    waitingForBalance: policy.enabled && (budget == null || !hasFreshBalance(account.quota.codexCredits)),
-    maxUsage: resolved?.maxUsage ?? null,
-    used: resolved?.used ?? null,
+    waitingForBalance: policy.enabled && (ledger == null || !hasFreshBalance(account.quota.codexCredits)),
+    maxUsage: policy.automatic ? automatic?.maxUsage ?? null : policy.maxUsage,
+    used: ledger?.used ?? null,
   };
 }
 

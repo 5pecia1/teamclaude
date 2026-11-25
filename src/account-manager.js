@@ -2117,8 +2117,11 @@ export class AccountManager {
     const parked = idx != null ? this.accounts[idx] : null;
     if (!parked || this._isAvailable(parked)) return;
     if (this._manualSelection(null, null, null, provider)?.account === parked) return;
-    if (!parked.allowExtraUsage && ![...this._extraUsage.values()].some(episodes => episodes.has(parked))) return;
+    const episodes = [...this._extraUsage.values()].flatMap(scope => scope.has(parked) ? [scope.get(parked)] : []);
+    if (!parked.allowExtraUsage && !episodes.length) return;
     const partition = this._excludeOtherProviders(null, provider);
+    if (provider === 'codex' && episodes.some(e => e?.preferred && [...e.advisors.values()].some(advisor =>
+      this._pickCodexCreditAccount(partition, e.model, advisor, provider)?.account === parked))) return;
     const extra = this._preferredExtraUsage(partition, null, null, provider);
     if (extra && !extra.has(parked.index)) return;
     // Where the preference applies, general traffic goes to its pool rather
@@ -2307,6 +2310,10 @@ export class AccountManager {
         }
         const partition = this._excludeOtherProviders(null, e.provider);
         const needed = [...e.advisors.values()].some(advisor => {
+          if (e.preferred && e.provider === 'codex') {
+            const credit = this._pickCodexCreditAccount(partition, e.model, advisor, e.provider);
+            return !!credit && credit.account === e.account && credit.fallback && credit.paid === e.paid;
+          }
           const manual = this._manualSelection(partition, e.model, advisor, e.provider);
           if (manual?.fallback && manual.account === e.account) return true;
           const extra = this._preferredExtraUsage(partition, e.model, advisor, e.provider);
@@ -2323,7 +2330,10 @@ export class AccountManager {
               && isSubscriptionAccount(a) && this.fallbackTier(a, e.model, advisor) === 'free')) return false;
           return !this.accounts.some(a => !partition?.has(a.index) && this._isAvailable(a, e.model));
         });
-        if (!needed) this._endFallback(scope, 'Quota headroom is back', e.account);
+        if (!needed) {
+          const reason = e.preferred && e.provider === 'codex' ? 'Codex credit preference no longer applies' : 'Quota headroom is back';
+          this._endFallback(scope, reason, e.account);
+        }
       }
     }
   }
@@ -2358,6 +2368,11 @@ export class AccountManager {
     const reach = advisorModel && this.advisorEligibility === 'prefer'
       ? this._advisorReach(excluded, model, advisorModel) : null;
     const selectedAdvisor = reach && reach.eligible < reach.of ? null : advisorModel;
+    const credit = this._pickCodexCreditAccount(excluded, model, selectedAdvisor, provider);
+    if (credit) {
+      if (credit.fallback) this._noteFallback(this._cursorKey(model, null, provider), credit, model, true, selectedAdvisor, true);
+      return credit.account;
+    }
     const extra = this._preferredExtraUsage(excluded, model, selectedAdvisor, provider);
     const normal = this._pickBestAvailable(extra ?? excluded, model, selectedAdvisor);
     if (normal) return normal;
@@ -2544,6 +2559,15 @@ export class AccountManager {
       const kept = this._keepOnCordoned(sessionId, exclude, model, advisorModel);
       if (kept) return kept;
     }
+    const provider = this._selectingProvider ?? DEFAULT_PROVIDER;
+    const credit = this._pickCodexCreditAccount(exclude, model, advisorModel, provider);
+    if (credit) {
+      if (credit.fallback) return this._activateFallback(credit, exclude, model, provider, advisorModel, true);
+      const { account } = credit;
+      if (this._previousCursor(model, advisorModel) !== account.index) this._beginRamp(account);
+      if (this.currentIndex !== account.index && !this._currentBarredOnlyFor(model, advisorModel, exclude)) this._setCurrent(account);
+      return account;
+    }
     // Session-affinity distribution (opt-in): keep a conversation on its pinned
     // account for cache reuse, and route a new one to the least-loaded account.
     // The unit is the conversation rather than the client session because one
@@ -2565,7 +2589,6 @@ export class AccountManager {
         if (acc) return acc;
       }
     }
-    const provider = this._selectingProvider ?? DEFAULT_PROVIDER;
     const pinned = this._pinnedAccountForModel(model, advisorModel);
     const eligiblePin = pinned && !exclude?.has(pinned.index) && this._isAvailable(pinned, model, advisorModel);
     const manual = this._manualSelection(exclude, model, advisorModel, provider);
@@ -3615,6 +3638,8 @@ export class AccountManager {
     const pinned = this._pinnedAccountForModel(model);
     const eligiblePin = allowed(pinned) && this._isAvailable(pinned, model);
     if (eligiblePin) return pinned.index;
+    const credit = this._pickCodexCreditAccount(excluded, model, null, provider);
+    if (credit) return credit.account.index;
     const manual = this._manualSelection(excluded, model, null, provider);
     if (manual?.fallback) return manual.account.index;
     const extra = this._preferredExtraUsage(excluded, model, null, provider);
@@ -3907,8 +3932,8 @@ export class AccountManager {
     for (const account of this.accounts) {
       if (exclude?.has(account.index)) continue;
       if (!this._isProbeable(account)) continue;
-      // A live inference probe can bill. Credit-enabled accounts are selected
-      // by the free-first fallback instead; read-only probes refresh the rest.
+      // A live inference probe can bill. Paid Codex selection uses the credit
+      // policy; read-only probes refresh accounts with unproven headroom.
       if ((account.codexCredits || (providerOf(account) === 'codex' && this.accounts.some(a => a.codexCredits?.enabled)))
           && !codexIncludedQuota(account, model)) continue;
       // A family-exhausted account can't serve that family even as a probe — it
@@ -4011,6 +4036,45 @@ export class AccountManager {
    * @param {string|null} [model] */
   _scopeLabel(model) {
     return model ? ` for "${safeLine(model, 64)}"` : '';
+  }
+
+  /** Prefer verified Codex credit budgets before ordinary rotation. A paid
+   * pick comes first; otherwise spend that account's included quota all the
+   * way to its upstream limit. Reuse the normal and fallback eligibility gates.
+   * @param {Set<number>|null} exclude
+   * @param {string|null} model
+   * @param {string|null} advisorModel
+   * @param {string} provider
+   * @returns {{account: Record<string, any>, paid: boolean, fallback: boolean}|null}
+   */
+  _pickCodexCreditAccount(exclude, model, advisorModel, provider) {
+    if (provider !== 'codex' || !this.accounts.some(a => a.codexCredits?.enabled)) return null;
+    const pinned = this._pinnedAccountForModel(model, advisorModel);
+    if (pinned && canServeProvider(pinned, provider) && !exclude?.has(pinned.index)
+        && this._isAvailable(pinned, model, advisorModel)) return null;
+    const manual = this._manualAccount;
+    if (!this.distributeSessions && manual && this._isManualChoice(manual, provider) && !exclude?.has(manual.index)
+        && this._isAvailable(manual, model, advisorModel)) return null;
+
+    let best = null;
+    let bestPriority = Infinity;
+    let bestUsage = Infinity;
+    for (const account of this.accounts) {
+      if (exclude?.has(account.index) || !codexCreditsAvailable(account)) continue;
+      const fallback = !this._isAvailable(account, model, advisorModel);
+      const tier = fallback ? this.fallbackTier(account, model, advisorModel) : null;
+      if (fallback && !tier) continue;
+      const paid = tier === 'paid';
+      const priority = account.priority || 0;
+      const usage = this._maxUtilization(account, model);
+      const outranks = priority < bestPriority || (priority === bestPriority && usage < bestUsage);
+      if (!best || (paid === best.paid ? outranks : paid)) {
+        best = { account, paid, fallback };
+        bestPriority = priority;
+        bestUsage = usage;
+      }
+    }
+    return best;
   }
 
   /**

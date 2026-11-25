@@ -16,6 +16,7 @@ import { mintAccountId } from './account-id.js';
 import { ACCOUNT_REFUSAL_CODES } from './account-refusal.js';
 import { formatPercent, heldFableResets, heldResetCredits, showSessionRow, showWeeklyRow, unavailableLine } from './status-renderer.js';
 import { cacheUsageLabel, cacheUsageState } from './usage-label.js';
+import { codexCreditStatus } from './codex-credits.js';
 import { statusLabel } from './error-type.js';
 import { resolveMaxUsage, resolveMaxSpendMinor, switchThresholdDiffs, modelLabel, EFFORT_SEP } from './model.js';
 import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy, localListener, isSelfProxy } from './upstream-proxy.js';
@@ -3236,10 +3237,8 @@ export class TUI {
         const tag = routingTag(a);
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
-      // And for the prepaid-credit tag (`$176.55 left`), drawn on every width:
-      // the bar may yield, the amount left may not.
-      const prepaidW = credits.reduce((/** @type {number} */ w, /** @type {any} */ c) => {
-        const tag = creditTag(c);
+      const budgetW = members.reduce((w, a, i) => {
+        const tag = cat === 'unified' ? this._codexCreditTag(a) : creditTag(credits[i]);
         return tag ? Math.max(w, 2 + vw(tag)) : w;
       }, 0);
       // The routing tag is the first to yield when even one bar at BAR_MIN no longer fits beside the rest: the address
@@ -3247,7 +3246,7 @@ export class TUI {
       // that, a routed credit account reserved 82 columns at W=80 before any bar and fitLine cut the address off
       // (Copilot's review of #649).
       const layout = (/** @type {number} */ tagW) => {
-        const fixedWithRoute = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + endsW + routeW + prepaidW;
+        const fixedWithRoute = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + endsW + routeW + budgetW;
         const routeTags = routeW === 0 || fixedWithRoute + BAR_MIN <= W;
         return { fixed: routeTags ? fixedWithRoute : fixedWithRoute - routeW, routeTags };
       };
@@ -3741,6 +3740,8 @@ export class TUI {
     // What is left of the prepaid credit, beside its bar.
     const prepaid = creditTag(credit);
     if (prepaid) line += `  ${creditColor(credit)(prepaid)}`;
+    const codexCredit = this._codexCreditTag(a);
+    if (codexCredit) line += `  ${codexCredit}`;
     // Money tag last, so it sits at the end of the row where the eye lands after
     // the bars. Red once real money has moved, yellow while it only could.
     const money = spendTag(q, a.maxSpend);
@@ -3778,6 +3779,21 @@ export class TUI {
    * @param {any} a */
   _credit(a) {
     return typeof this.am.creditStatus === 'function' ? this.am.creditStatus(a) : (a.credit ?? null);
+  }
+
+  /** @param {Record<string, any>} account */
+  _codexCreditTag(account) {
+    if (providerOf(account) !== 'codex' || account.type !== 'oauth') return '';
+    const credit = this.remote ? account.codexCredits : codexCreditStatus(account);
+    if (credit?.enabled !== true) return '';
+    const { used, maxUsage } = credit;
+    const hasBudget = Number.isFinite(maxUsage) && maxUsage >= 0 && Number.isFinite(used) && used >= 0;
+    if (!hasBudget) return maxUsage === 0 ? red('Cr limit 0') : yellow('Cr waiting');
+    const spent = used >= maxUsage;
+    const waiting = credit.waitingForBalance === true && !spent;
+    const amount = `${used}/${maxUsage}`;
+    const value = amount.length <= 15 ? amount : `${spent ? 100 : Math.min(99, Math.floor(used / maxUsage * 100))}%`;
+    return (spent ? red : waiting ? yellow : cyan)(`Cr ${value}${waiting ? '?' : ''}`);
   }
 
   /** Whether the account behind this row is serving on extra usage. Asked of

@@ -13,11 +13,11 @@ teamclaude --version
 In your existing config, set the top-level `"autoUpdate": false` so background updates leave the fork installed. To enable the automatic budget, set `"codexCredits": true` on the desired Codex OAuth account in `accounts`. Keep the adjacent state file to retain your budget history. [Codex credit budget](quota.md#codex-credit-budget)
 
 ```sh
-npm install -g --ignore-scripts https://github.com/5pecia1/teamclaude/releases/download/v1.1.31-codex.2/teamclaude-1.1.31-codex.2.tgz &&
+npm install -g --ignore-scripts https://github.com/5pecia1/teamclaude/releases/download/v1.1.31-codex.3/teamclaude-1.1.31-codex.3.tgz &&
 systemctl --user restart teamclaude.service
 ```
 
-Run `teamclaude status --json` to check the running version and the account's budget. For future fork updates, use the new release's archive URL and restart the same service. The built-in `teamclaude update` targets upstream npm.
+Run `teamclaude status --json` to check the running version and `teamclaude attach` to see the credit budget on the account row. For future fork updates, use the new release's archive URL and restart the same service. The built-in `teamclaude update` targets upstream npm.
 
 ## Roll back
 
